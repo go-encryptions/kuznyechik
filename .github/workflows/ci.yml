@@ -1,0 +1,140 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Coverage floor for the cipher package. Kuznyechik is plain Go with no
+  # per-architecture code, so every target holds 100% of statements and
+  # produces the same ciphertext (the Botan vectors are checked on each).
+  # internal/genbotan and internal/botanbench are development tools that need
+  # the Botan command line; they are tested but not gated.
+  COVER_MIN: "100.0"
+
+jobs:
+  # ---- Native runners: race-enabled run with the coverage gate ----
+  native:
+    name: native ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          check-latest: true
+          cache: true
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: vet
+        run: go vet ./...
+      - name: build
+        run: go build ./...
+      - name: test tools
+        run: go test ./internal/...
+      - name: test (race + coverage gate)
+        run: |
+          set -euo pipefail
+          go test -race -coverprofile=cover.out . | tee cover.txt
+          pct=$(grep -oE 'coverage: [0-9.]+%' cover.txt | grep -oE '[0-9.]+' | head -1)
+          echo "coverage on ${{ matrix.arch }}: ${pct}% (floor ${COVER_MIN}%)"
+          awk -v p="$pct" -v m="$COVER_MIN" 'BEGIN { exit !(p+0 >= m+0) }' \
+            || { echo "coverage ${pct}% < ${COVER_MIN}%"; exit 1; }
+
+  # ---- Emulated targets (QEMU via binfmt) ------------------------------
+  # s390x is BIG-ENDIAN: it proves the explicit little-endian word loads
+  # and the table construction give the same ciphertext as on the
+  # little-endian targets.
+  # riscv64 is a second, different 64-bit ISA. The race detector is not
+  # supported under cross/QEMU, so these run the cover-instrumented test
+  # binary and gate on coverage.
+  emulated:
+    name: emulated ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: s390x
+            image: debian:trixie
+            qemu_cpu: qemu
+          - arch: riscv64
+            image: debian:trixie
+            qemu_cpu: "rv64,v=true,vlen=128"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          check-latest: true
+          cache: true
+
+      - name: register QEMU binfmt handlers
+        run: docker run --rm --privileged tonistiigi/binfmt --install all
+
+      - name: cross-compile the test binary
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p _tbin
+          go test -c -cover -covermode=atomic -o _tbin/kuznyechik.test .
+          ls -l _tbin
+
+      - name: run the test binary under QEMU (${{ matrix.arch }})
+        run: |
+          set -euo pipefail
+          out=$(docker run --rm --platform linux/${{ matrix.arch }} \
+            -e QEMU_CPU='${{ matrix.qemu_cpu }}' \
+            -v "$PWD:/src:ro" -w /src \
+            ${{ matrix.image }} /src/_tbin/kuznyechik.test -test.v 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          pct=$(echo "$out" | grep -oE 'coverage: [0-9.]+%' | grep -oE '[0-9.]+' | head -1)
+          echo "coverage on ${{ matrix.arch }}: ${pct}% (floor ${COVER_MIN}%)"
+          awk -v p="$pct" -v m="$COVER_MIN" 'BEGIN { exit !(p+0 >= m+0) }' \
+            || { echo "coverage ${pct}% < ${COVER_MIN}%"; exit 1; }
+
+  # ---- Fuzz: Encrypt/Decrypt round trip and key-size refusal ------------
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          check-latest: true
+          cache: true
+      - name: fuzz FuzzRoundTrip (60s)
+        run: go test -run '^FuzzRoundTrip$' -fuzz '^FuzzRoundTrip$' -fuzztime 60s .
+
+  # ---- Known vulnerabilities in the module and the toolchain -----------
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+          check-latest: true
+          cache: true
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          govulncheck ./...
